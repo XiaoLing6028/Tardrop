@@ -6,10 +6,9 @@ description = "A safe, user-local installer for portable application archives"
 license = "GPL-3.0-or-later"
 
 [dependencies]
-# eframe provides a cross-desktop native window and drag-and-drop without a GTK/Qt system dependency.
-eframe = { version = "0.32", default-features = true }
-# rfd uses desktop file dialogs (including the XDG portal on KDE Wayland).
-rfd = "0.16"
+# gtk4 provides the native toolkit: real widgets, the system file dialog, and Wayland/X11
+# drag-and-drop, all through GTK's own main loop.
+gtk4 = { version = "0.11", features = ["v4_10"] }
 anyhow = "1.0"
 thiserror = "2.0"
 # Archive readers used by the format-specific, path-validated extractors.
@@ -25,6 +24,7 @@ tempfile = "3.23"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
+adw = { version = "0.9", package = "libadwaita", features = ["v1_6"] }
 
 [profile.release]
 lto = true

@@ -13,10 +13,12 @@ Existing installations are either replaced, given a separate numbered directory,
 * GNU/Linux on x86_64
 * Rust stable (edition 2024)
 * A working Wayland or X11 session
+* GTK 4 and libadwaita development files (`gtk4-devel libadwaita-devel` on Fedora,
+  `libgtk-4-dev libadwaita-1-dev` on Debian/Ubuntu)
 * A desktop opener (`xdg-open`) for the optional **Open folder** button
 * `update-desktop-database` is optional; Plasma also discovers the user launcher directory directly
 
-`eframe` is used for the GUI because it gives one native desktop build for both KDE Wayland and X11 without requiring Qt or GTK development packages. KDE uses the normal XDG desktop-entry location, so installed apps appear in Application Launcher, Kickoff, and KRunner.
+GTK 4 with libadwaita is used for the GUI because it provides real native widgets, the system file dialog, and Wayland/X11 drag-and-drop from one desktop build. The window follows GNOME's human interface guidelines — an adaptive navigation split view, boxed lists, toasts, and `AdwAlertDialog` — and takes its light/dark preference and accent colour from the desktop rather than hardcoding a palette. KDE uses the normal XDG desktop-entry location, so installed apps appear in Application Launcher, Kickoff, and KRunner.
 
 ## Build and run
 
@@ -25,7 +27,7 @@ cargo build --release
 ./target/release/tardrop
 ```
 
-For development, use `cargo run`. Cargo downloads the Rust dependencies on the first build. On distributions with no Wayland/X11 development runtime, install the desktop graphics packages recommended by the `eframe`/winit documentation.
+For development, use `cargo run`. Cargo downloads the Rust dependencies on the first build. The GTK 4 and libadwaita development packages must be installed first, because the bindings link against the system libraries.
 
 ## Architecture
 

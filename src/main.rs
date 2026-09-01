@@ -13,16 +13,21 @@ mod ui;
 mod updates;
 mod utils;
 
-use ui::TarDropApp;
+use adw::prelude::*;
+use gtk4::glib;
+
+/// Reverse-DNS application id GTK uses for the Wayland app-id, so the shell matches the window to
+/// TarDrop's own desktop entry instead of showing a generic placeholder in the task switcher.
+const APP_ID: &str = "org.tardrop.TarDrop";
 
 /// Starts the desktop application and reports failures to the terminal too.
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 600.0])
-            .with_min_inner_size([680.0, 440.0])
-            .with_drag_and_drop(true),
-        ..Default::default()
-    };
-    eframe::run_native("TarDrop", options, Box::new(|cc| Ok(Box::new(TarDropApp::new(cc)))))
+///
+/// `adw::Application` is used rather than `gtk::Application` because it initialises libadwaita's
+/// style manager, which is what makes the window follow the desktop's light/dark preference and
+/// accent colour instead of shipping its own hardcoded palette.
+fn main() -> glib::ExitCode {
+    let application = adw::Application::builder().application_id(APP_ID).build();
+    application.connect_activate(ui::build_ui);
+    // GTK parses its own switches; passing none keeps archive paths from being read as options.
+    application.run_with_args::<&str>(&[])
 }
