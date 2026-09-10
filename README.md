@@ -18,6 +18,12 @@ Existing installations are either replaced, given a separate numbered directory,
 * A desktop opener (`xdg-open`) for the optional **Open folder** button
 * `update-desktop-database` is optional; Plasma also discovers the user launcher directory directly
 
+On Fedora you can install the build dependencies with:
+
+```bash
+sudo dnf install rust cargo gtk4-devel libadwaita-devel
+```
+
 GTK 4 with libadwaita is used for the GUI because it provides real native widgets, the system file dialog, and Wayland/X11 drag-and-drop from one desktop build. The window follows GNOME's human interface guidelines — an adaptive navigation split view, boxed lists, toasts, and `AdwAlertDialog` — and takes its light/dark preference and accent colour from the desktop rather than hardcoding a palette. KDE uses the normal XDG desktop-entry location, so installed apps appear in Application Launcher, Kickoff, and KRunner.
 
 ## Build and run
