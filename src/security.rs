@@ -4,6 +4,17 @@ use std::{fs, io::Read, path::Path};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
+/// A refusal caused by what the archive contains, as opposed to an I/O or format failure. The UI
+/// recognises it by type and is the only place that may offer to retry under `Policy::Override`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Rejected(pub String);
+
+/// Whether content checks are enforced. `Override` is only ever chosen explicitly by the user after
+/// seeing a `Rejected` reason; it never allows a write outside the private staging directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Policy { #[default] Enforce, Override }
+
 /// Hashes the input while reading it, both providing an audit value and detecting read failures.
 pub fn archive_sha256(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path).context("could not open archive")?;

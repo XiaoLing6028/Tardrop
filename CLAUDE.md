@@ -75,3 +75,6 @@ extraction, and publication live in the installer modules. Keep it that way when
 - No colours or spacing are hardcoded in the UI; libadwaita style classes supply them.
 - Strictness over convenience is intentional. Archives that ordinary tools accept are rejected here
   because the input is assumed untrusted — do not relax a validation to make an archive work.
+  The one sanctioned escape hatch is user-initiated: content-check failures are raised as
+  `security::Rejected`, and the UI offers a retry with `Policy::Override`. Traversal/absolute paths
+  stay unwritable even then. New checks should return `Rejected` so they participate in this flow.

@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, fs, path::{Component, Path, PathBuf}};
 use anyhow::{bail, Context, Result};
 use tempfile::Builder;
 use walkdir::WalkDir;
-use crate::{archive, desktop, icons, security, updates, utils};
+use crate::{archive, desktop, icons, security::{self, Policy}, updates, utils};
 
 /// A completed installation, retained by the UI for launch/open/uninstall actions.
 #[derive(Clone, Debug)]
@@ -23,7 +23,8 @@ pub struct LauncherCandidate { pub relative_path: PathBuf, pub score: i32, pub r
 pub enum InstallResult { Installed(InstalledApp), NeedsLauncherChoice(Vec<LauncherCandidate>) }
 
 /// Installs an archive only below `~/Applications`; all public changes happen after inspection.
-pub fn install(source: &Path, choice: ExistingChoice, selected_launcher: Option<&Path>, log: &mut Vec<String>) -> Result<InstallResult> {
+/// Content-check failures surface as `security::Rejected`; `Policy::Override` relaxes them on request.
+pub fn install(source: &Path, choice: ExistingChoice, selected_launcher: Option<&Path>, policy: Policy, log: &mut Vec<String>) -> Result<InstallResult> {
     let format = archive::detect(source)?;
     let hash = security::archive_sha256(source)?;
     let base_name = utils::archive_stem(source);
@@ -31,15 +32,16 @@ pub fn install(source: &Path, choice: ExistingChoice, selected_launcher: Option<
     let applications = utils::applications_dir()?;
     let staging = Builder::new().prefix(".tardrop-").tempdir_in(&applications).context("could not make private staging directory")?;
     log.push("Extracting archive into private staging directory…".into());
-    archive::extract(source, format, staging.path())?;
+    archive::extract(source, format, staging.path(), policy, log)?;
     let extracted_root = package_root(staging.path());
     log.push("Scoring safe launcher candidates…".into());
-    let candidates = executable_candidates(&extracted_root, &base_name)?;
+    let candidates = executable_candidates(&extracted_root, &base_name, policy)?;
     let executable = match selected_launcher {
         Some(relative) => candidates.iter().find(|candidate| candidate.relative_path == relative)
             .map(|candidate| extracted_root.join(&candidate.relative_path))
             .ok_or_else(|| anyhow::anyhow!("selected launcher is no longer a safe candidate"))?,
-        None if candidates.is_empty() => bail!("No safe application launcher was found."),
+        None if candidates.is_empty() && policy == Policy::Enforce => return Err(security::Rejected("No safe application launcher was found.".into()).into()),
+        None if candidates.is_empty() => bail!("The archive contains no executable file to launch."),
         None if candidates.len() > 1 && candidates[0].score - candidates[1].score <= 10 => {
             log.push("Top launcher candidates are too close to choose safely; asking you to decide.".into());
             return Ok(InstallResult::NeedsLauncherChoice(candidates));
@@ -125,7 +127,7 @@ fn package_root(staging: &Path) -> PathBuf {
 
 /// Scores likely application launchers. A score is deliberately explainable: archive metadata
 /// and familiar launcher names beat arbitrary nested binaries, while library/document trees lose.
-fn executable_candidates(root: &Path, archive_name: &str) -> Result<Vec<LauncherCandidate>> {
+fn executable_candidates(root: &Path, archive_name: &str, policy: Policy) -> Result<Vec<LauncherCandidate>> {
     let folder_name = root.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
     let archive_name = archive_name.to_ascii_lowercase();
     let mut scores: BTreeMap<PathBuf, (i32, String)> = BTreeMap::new();
@@ -149,7 +151,8 @@ fn executable_candidates(root: &Path, archive_name: &str) -> Result<Vec<Launcher
         let is_native_binary = security::is_elf(path);
         // Scripts are candidates only when their names clearly identify them as launchers.
         let is_launcher_script = filename.starts_with("start-") || filename.starts_with("launch-") || filename.starts_with("run-") || filename.ends_with(".sh");
-        if !is_native_binary && !is_launcher_script { continue; }
+        // An override admits any executable, e.g. a wrapper script without a launcher-like name.
+        if !is_native_binary && !is_launcher_script && policy == Policy::Enforce { continue; }
         if filename == "apprun" && path.parent() == Some(root) { add_candidate(&mut scores, root, path, 100, "root AppRun"); continue; }
         let depth = path.strip_prefix(root)?.components().count();
         if is_launcher_script { add_candidate(&mut scores, root, path, 90, "named launcher script"); }
@@ -157,6 +160,7 @@ fn executable_candidates(root: &Path, archive_name: &str) -> Result<Vec<Launcher
         if filename == archive_name { add_candidate(&mut scores, root, path, 70, "filename matches archive"); }
         if filename == folder_name { add_candidate(&mut scores, root, path, 70, "filename matches extraction folder"); }
         if is_native_binary { add_candidate(&mut scores, root, path, 20, "nested executable"); }
+        else if policy == Policy::Override { add_candidate(&mut scores, root, path, 10, "executable script (safety checks overridden)"); }
     }
     let mut candidates: Vec<_> = scores.into_iter().map(|(relative_path, (score, reason))| LauncherCandidate { relative_path, score, reason }).collect();
     candidates.sort_by(|left, right| right.score.cmp(&left.score).then_with(|| left.relative_path.cmp(&right.relative_path)));

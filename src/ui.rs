@@ -29,6 +29,7 @@ use gtk4::{gdk, gio, glib};
 
 use crate::{
     installer::{self, ExistingChoice, InstallResult, InstalledApp, LauncherCandidate},
+    security::{Policy, Rejected},
     updates::{self, InstalledDatabase, InstalledRecord, ReleaseInfo, UpdateInterval, UpdateSettings},
     utils,
 };
@@ -89,6 +90,8 @@ struct State {
     receiver: Option<Receiver<WorkResult>>,
     current: Option<PathBuf>,
     current_choice: Option<ExistingChoice>,
+    /// Whether the running install was explicitly allowed past failed safety checks.
+    current_policy: Policy,
     log: Vec<String>,
     installed: Vec<InstalledApp>,
     /// True while a decision dialog owns the queue, so the next archive waits for the answer.
@@ -209,6 +212,7 @@ pub fn build_ui(application: &adw::Application) {
             receiver: None,
             current: None,
             current_choice: None,
+            current_policy: Policy::Enforce,
             log: vec!["Ready. Drop a portable archive to install it safely.".into()],
             installed: Vec::new(),
             decision_open: false,
@@ -588,17 +592,18 @@ fn start_next(app: &Rc<App>) {
     if likely_target.as_ref().is_some_and(|target| target.exists()) {
         ask_existing(app, path);
     } else {
-        start_worker(app, path, ExistingChoice::KeepBoth, None);
+        start_worker(app, path, ExistingChoice::KeepBoth, None, Policy::Enforce);
     }
 }
 
 /// Runs an install on a worker so animation, input, and dialogs remain responsive.
-fn start_worker(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, selected_launcher: Option<PathBuf>) {
+fn start_worker(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, selected_launcher: Option<PathBuf>, policy: Policy) {
     let (sender, receiver) = mpsc::channel();
     {
         let mut state = app.state.borrow_mut();
         state.current = Some(path.clone());
         state.current_choice = Some(choice);
+        state.current_policy = policy;
         state.log.push(format!("Installing {}…", path.display()));
         state.receiver = Some(receiver);
     }
@@ -606,7 +611,7 @@ fn start_worker(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, selected_l
     refresh_activity(app);
     std::thread::spawn(move || {
         let mut log = Vec::new();
-        let result = installer::install(&path, choice, selected_launcher.as_deref(), &mut log);
+        let result = installer::install(&path, choice, selected_launcher.as_deref(), policy, &mut log);
         let _ = sender.send(WorkResult { result, log });
     });
 }
@@ -622,13 +627,14 @@ fn poll_worker(app: &Rc<App>) {
     let finished = { let state = app.state.borrow(); state.receiver.as_ref().and_then(|receiver| receiver.try_recv().ok()) };
     let Some(work) = finished else { return };
 
-    let (path, choice) = {
+    let (path, choice, policy) = {
         let mut state = app.state.borrow_mut();
         state.receiver = None;
         let path = state.current.take();
         let choice = state.current_choice.take().unwrap_or(ExistingChoice::KeepBoth);
+        let policy = std::mem::take(&mut state.current_policy);
         state.log.extend(work.log);
-        (path, choice)
+        (path, choice, policy)
     };
     refresh_log(app);
 
@@ -645,7 +651,12 @@ fn poll_worker(app: &Rc<App>) {
             show_toast(app, &format!("{name} is ready to use"));
         }
         Ok(InstallResult::NeedsLauncherChoice(candidates)) => {
-            if let Some(path) = path { ask_launcher(app, path, choice, candidates); }
+            if let Some(path) = path { ask_launcher(app, path, choice, policy, candidates); }
+        }
+        // Only a content-check refusal is overridable, and only once: an overridden install that
+        // still fails reports the error normally instead of offering the same choice again.
+        Err(error) if policy == Policy::Enforce && path.is_some() && error.downcast_ref::<Rejected>().is_some() => {
+            if let Some(path) = path { ask_override(app, path, choice, format!("{error:#}")); }
         }
         Err(error) => show_error(app, format!("Installation failed: {error:#}")),
     }
@@ -1001,7 +1012,7 @@ fn ask_existing(app: &Rc<App>, path: PathBuf) {
     dialog.connect_response(None, move |_, response| {
         let choice = match response { "replace" => ExistingChoice::Replace, "keep" => ExistingChoice::KeepBoth, _ => return };
         resolve(&handle);
-        start_worker(&handle, path.clone(), choice, None);
+        start_worker(&handle, path.clone(), choice, None, Policy::Enforce);
     });
 
     hold_queue(app, &dialog, "Installation cancelled.");
@@ -1009,7 +1020,7 @@ fn ask_existing(app: &Rc<App>, path: PathBuf) {
 }
 
 /// Presents the scored launcher candidates when the installer refuses to guess between them.
-fn ask_launcher(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, candidates: Vec<LauncherCandidate>) {
+fn ask_launcher(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, policy: Policy, candidates: Vec<LauncherCandidate>) {
     let dialog = adw::AlertDialog::builder()
         .heading("Choose Application Launcher")
         .body("Several launchers look equally suitable. A higher score means TarDrop is more confident that file is the right one to start.")
@@ -1034,13 +1045,39 @@ fn ask_launcher(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, candidates
         row.connect_activated(move |_| {
             resolve(&handle);
             dialog.close();
-            start_worker(&handle, source.clone(), choice, Some(selected.clone()));
+            start_worker(&handle, source.clone(), choice, Some(selected.clone()), policy);
         });
         list.append(&row);
     }
     dialog.set_extra_child(Some(&gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).max_content_height(320).propagate_natural_height(true).margin_top(6).child(&list).build()));
 
     hold_queue(app, &dialog, "Installation cancelled while choosing a launcher.");
+    dialog.present(Some(&app.window));
+}
+
+/// Explains why an archive was refused and lets the user decide whether to trust it anyway.
+/// Refusing is the default and the close response; overriding is styled as destructive.
+fn ask_override(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, reason: String) {
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+    let dialog = adw::AlertDialog::builder()
+        .heading("Installation Blocked")
+        .body(format!("“{name}” did not pass TarDrop’s safety checks:\n\n{reason}\n\nOnly continue if you trust where this archive came from. Files that would land outside the application’s own folder are skipped either way."))
+        .build();
+    dialog.add_response("cancel", "Don’t Install");
+    dialog.add_response("override", "Trust and Install");
+    dialog.set_response_appearance("override", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let handle = app.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "override" { return; }
+        resolve(&handle);
+        handle.state.borrow_mut().log.push("Retrying with safety checks overridden at your request.".into());
+        start_worker(&handle, path.clone(), choice, None, Policy::Override);
+    });
+
+    hold_queue(app, &dialog, "Installation blocked by safety checks.");
     dialog.present(Some(&app.window));
 }
 

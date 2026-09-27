@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, fs, path::{Path, PathBuf}, time::{SystemTime, U
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tempfile::Builder;
-use crate::{installer::{self, ExistingChoice, InstallResult, InstalledApp}, utils};
+use crate::{installer::{self, ExistingChoice, InstallResult, InstalledApp}, security::Policy, utils};
 
 /// One installed portable application, stored independently from the application archive.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -138,7 +138,7 @@ pub fn update(record: &InstalledRecord, log: &mut Vec<String>) -> Result<Install
     let old_permissions = fs::metadata(&record.install_path).ok().map(|metadata| metadata.permissions());
     log.push("Creating rollback snapshot…".into());
     fs::rename(&record.install_path, &saved_directory).context("could not move current application into rollback snapshot")?;
-    let result = installer::install(&archive, ExistingChoice::Replace, None, log);
+    let result = installer::install(&archive, ExistingChoice::Replace, None, Policy::Enforce, log);
     let installed = match result {
         Ok(InstallResult::Installed(app)) if app.directory == record.install_path => app,
         Ok(InstallResult::Installed(app)) => {
