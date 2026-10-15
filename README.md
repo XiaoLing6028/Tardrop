@@ -4,7 +4,19 @@ TarDrop is a KDE-friendly, user-local installer for portable application archive
 
 ## Safety model
 
-TarDrop does not use `tar`, `unzip`, a shell, or `sudo`. Archives are extracted into a private staging directory first. Every member path is checked, and absolute paths, `..`, symlinks, hard links, device files, and overwrite attempts are rejected. Only regular files and directories are accepted. It never runs archive scripts; `install.sh` is not a launch candidate. A launcher is made only for an ELF binary, and is never automatically launched.
+TarDrop does not use `tar`, `unzip`, a shell, or `sudo`. Archives are extracted into a private staging directory first. Every member path is checked, and absolute paths, `..`, symlinks, hard links, device files, and overwrite attempts are rejected. Only regular files and directories are accepted. It never runs archive scripts; `install.sh` is never a launch candidate, even when you choose to trust an archive. A launcher is made only for an ELF binary, and is never automatically launched.
+
+### Risk review
+
+Before anything is extracted, TarDrop reads every member header. If the archive contains symlinks, hard links, or an `install.sh`, the install pauses and shows a risk level with its reasons and the flagged members, for example *High — install.sh script found (1), 2 symlinks escape the package*:
+
+| Level | When |
+| --- | --- |
+| Low | no `install.sh`, and at most 1 symlink/hardlink, pointing inside the package |
+| Medium | no `install.sh`, and 2–3 symlinks/hardlinks, or any link pointing outside the package |
+| High | any `install.sh`, or 4 or more symlinks/hardlinks |
+
+A link "points outside" when following it, through the archive's own other links, leaves the folder that becomes `~/Applications/<App>`. **Don't Install** leaves nothing behind, not even a staging directory. **Trust and Install** extracts with those checks relaxed; paths that would land outside the application's folder are still never written, and the script is installed as an ordinary file but never run or used as the launcher.
 
 Existing installations are either replaced, given a separate numbered directory, or cancelled. Uninstall checks that it is deleting only an immediate child of `~/Applications` and the matching XDG launcher.
 
@@ -33,7 +45,7 @@ cargo build --release
 ./target/release/tardrop
 ```
 
-For development, use `cargo run`. Cargo downloads the Rust dependencies on the first build. The GTK 4 and libadwaita development packages must be installed first, because the bindings link against the system libraries.
+For development, use `cargo run`; `cargo test` runs the unit tests. Cargo downloads the Rust dependencies on the first build. The GTK 4 and libadwaita development packages must be installed first, because the bindings link against the system libraries.
 
 ## Architecture
 
@@ -56,4 +68,4 @@ An update is only downloaded after the user presses **Update**. TarDrop moves th
 
 ## Notes
 
-TarDrop intentionally rejects archives that contain symlinks, hardlinks, or special files. This is stricter than ordinary archive tools because the product’s job is safely handling untrusted downloads. Launcher discovery scores root `AppRun`, safe `Exec=` targets from nearby desktop files, conventional launcher scripts, root executables, and name matches. Dependency, documentation, and known helper-binary trees are heavily penalized. When the two top candidates are within 10 points, TarDrop shows a chooser instead of guessing.
+TarDrop intentionally refuses archives that contain symlinks, hardlinks, or special files unless you explicitly trust them; links and `install.sh` get the risk review above first. This is stricter than ordinary archive tools because the product’s job is safely handling untrusted downloads. Launcher discovery scores root `AppRun`, safe `Exec=` targets from nearby desktop files, conventional launcher scripts, root executables, and name matches. Dependency, documentation, and known helper-binary trees are heavily penalized. When the two top candidates are within 10 points, TarDrop shows a chooser instead of guessing.
