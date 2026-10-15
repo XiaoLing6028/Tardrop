@@ -27,7 +27,9 @@ Unit tests live in `#[cfg(test)] mod tests` blocks in `security`, `archive`, and
 `test_support` (test-only) builds real tar/zip archives with the same crates the extractor reads. Tests
 that call `installer::install` use `with_sandbox_home`, which re-executes the test binary with `HOME`
 pointed at a tempdir: `std::env::set_var` is `unsafe` in edition 2024 and the crate forbids unsafe, so
-never mutate the environment in-process. The UI has no tests; verify it by running the app.
+never mutate the environment in-process. `ui::tests` has one test that drives the real window through every decision dialog; it is
+`#[ignore]`d because it needs a display, so run it with `cargo test -- --ignored` (under `xvfb-run`
+to keep the window off screen). Otherwise verify UI changes by running the app.
 
 ## Architecture
 
@@ -72,8 +74,10 @@ extraction, and publication live in the installer modules. Keep it that way when
   only; installer and network work runs in `std::thread` workers that report back over `mpsc`, and a
   single GLib timeout (`tick`) drains those channels. Worker code therefore stays free of GTK types
   — do not pass widgets or `Rc<App>` into a thread. Shared UI state is `Rc<App>` with a
-  `RefCell<State>`; blocking decisions (existing install, launcher choice) use `AdwAlertDialog` and
-  pause the install queue via `hold_queue`/`resolve`.
+  `RefCell<State>`; blocking decisions (existing install, launcher choice, override) use
+  `AdwAlertDialog` and pause the install queue via `hold_queue`, which settles on the dialog's
+  `response` signal. Never use `closed` for that: libadwaita emits it *before* `response` when a
+  button is clicked, so the queue would be released before the answer starts its work.
 
 ## Conventions
 

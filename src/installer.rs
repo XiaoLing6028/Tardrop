@@ -260,33 +260,7 @@ pub fn uninstall(app: &InstalledApp) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-    use crate::{security::{Decision, Rejected, RiskLevel}, test_support::{self, Member::*, FAKE_ELF}};
-
-    /// Runs `body` with HOME pointing at a fresh directory, so installs never reach the real
-    /// `~/Applications`. The test re-executes itself as a child process: changing HOME in-process
-    /// needs `std::env::set_var`, which is `unsafe` in edition 2024 and forbidden in this crate.
-    fn with_sandbox_home(test: &str, body: impl FnOnce(&Path)) {
-        const MARKER: &str = "TARDROP_TEST_HOME";
-        if let Some(home) = std::env::var_os(MARKER) { return body(Path::new(&home)); }
-        let home = tempfile::tempdir().unwrap();
-        let module = module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest);
-        let name = format!("{module}::{test}");
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-            .env(MARKER, home.path()).env("HOME", home.path())
-            .env_remove("XDG_DATA_HOME").env_remove("XDG_CONFIG_HOME").env_remove("XDG_CACHE_HOME")
-            // `refresh_integrations` runs desktop-cache tools that would act on the real session.
-            .env("PATH", home.path().join("no-tools"))
-            .output().unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success() && stdout.contains("1 passed"), "sandboxed run of {name} failed:\n{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    /// Names inside `directory`, or nothing when it does not exist.
-    fn entries(directory: &Path) -> Vec<String> {
-        fs::read_dir(directory).map(|items| items.filter_map(Result::ok).map(|item| item.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
-    }
+    use crate::{security::{Decision, Rejected, RiskLevel}, test_support::{self, entries, with_sandbox_home, Member::*, FAKE_ELF}};
 
     fn refusal_risk(error: &anyhow::Error) -> security::RiskAssessment {
         error.downcast_ref::<Rejected>().and_then(|rejected| rejected.risk.clone()).unwrap_or_else(|| panic!("expected a risk-assessed refusal, got: {error:#}"))
@@ -294,7 +268,7 @@ mod tests {
 
     #[test]
     fn denying_the_risk_prompt_changes_nothing_and_approving_installs() {
-        with_sandbox_home("denying_the_risk_prompt_changes_nothing_and_approving_installs", |home| {
+        with_sandbox_home(|home| {
             let archive = test_support::tar(home, "demo.tar", &[
                 Dir("Demo"), File("Demo/demo", FAKE_ELF, 0o755), File("Demo/lib/libdemo.so.1", b"lib", 0o644),
                 Symlink("Demo/lib/libdemo.so", "libdemo.so.1"), Symlink("Demo/fonts", "/usr/share/fonts"),
@@ -326,7 +300,7 @@ mod tests {
 
     #[test]
     fn install_sh_is_refused_as_high_risk_and_never_becomes_the_launcher() {
-        with_sandbox_home("install_sh_is_refused_as_high_risk_and_never_becomes_the_launcher", |home| {
+        with_sandbox_home(|home| {
             let archive = test_support::tar(home, "tool.tar", &[File("Tool/tool", FAKE_ELF, 0o755), File("Tool/install.sh", b"#!/bin/sh\nexit 1\n", 0o755)]);
             let error = install(&archive, ExistingChoice::KeepBoth, None, Policy::Enforce, &mut Vec::new()).unwrap_err();
             assert_eq!(refusal_risk(&error).summary(), "High — install.sh script found (1)");
@@ -341,7 +315,7 @@ mod tests {
 
     #[test]
     fn clean_archive_installs_without_a_prompt() {
-        with_sandbox_home("clean_archive_installs_without_a_prompt", |home| {
+        with_sandbox_home(|home| {
             let archive = test_support::tar(home, "clean.tar", &[Dir("Clean"), File("Clean/clean", FAKE_ELF, 0o755), File("Clean/README", b"hi", 0o644)]);
             let result = install(&archive, ExistingChoice::KeepBoth, None, Policy::Enforce, &mut Vec::new()).unwrap();
             assert!(matches!(result, InstallResult::Installed(ref app) if app.directory == home.join("Applications/Clean")), "{result:?}");

@@ -143,7 +143,10 @@ struct App {
 }
 
 /// Builds the window on `AdwApplication::activate` and starts the worker poll.
-pub fn build_ui(application: &adw::Application) {
+pub fn build_ui(application: &adw::Application) { build(application); }
+
+/// `build_ui`, returning the shared handle so tests can drive the real window.
+fn build(application: &adw::Application) -> Rc<App> {
     load_styles();
     // libadwaita's layouts are drawn around the Adwaita symbolic icon set. Pinning it keeps the
     // interface coherent on desktops that ship a different default (Breeze, Papirus, …), where a
@@ -268,6 +271,7 @@ pub fn build_ui(application: &adw::Application) {
     if let Some(record) = due { check_record(&app, record); }
 
     window.present();
+    app
 }
 
 /// Registers the stylesheet once per display so every window and dialog inherits it.
@@ -980,25 +984,26 @@ fn record_row(app: &Rc<App>, record: &InstalledRecord, updates_only: bool, busy:
     expander
 }
 
-/// Marks the queue as blocked and resumes it however the decision dialog is dismissed, including
-/// the Escape key, so a stray dismissal can never strand the remaining archives.
-fn hold_queue(app: &Rc<App>, dialog: &adw::AlertDialog, cancel_note: &'static str) {
+/// Blocks the queue until `dialog` is answered, then hands the response to `answer`, which returns
+/// whether it started work; that work owns the queue until it reports back. Any other outcome —
+/// Cancel, Escape, a system close — logs `cancel_note` and moves on, so no dismissal strands the
+/// remaining archives.
+///
+/// This must listen to `response`, never `closed`. libadwaita emits `response` exactly once however
+/// an alert dialog closes, but a clicked button closes the dialog *before* emitting it, so a
+/// `closed` handler sees every answer as a cancellation and starts the next archive while the
+/// answered one is relaunched over it, losing one worker's result.
+fn hold_queue(app: &Rc<App>, dialog: &adw::AlertDialog, cancel_note: &'static str, answer: impl Fn(&str) -> bool + 'static) {
     app.state.borrow_mut().decision_open = true;
     let handle = app.clone();
-    dialog.connect_closed(move |_| {
-        let released = {
-            let mut state = handle.state.borrow_mut();
-            let held = state.decision_open;
-            state.decision_open = false;
-            if held { state.log.push(cancel_note.into()); }
-            held
-        };
-        if released { refresh_log(&handle); start_next(&handle); }
+    dialog.connect_response(None, move |_, response| {
+        handle.state.borrow_mut().decision_open = false;
+        if answer(response) { return; }
+        handle.state.borrow_mut().log.push(cancel_note.into());
+        refresh_log(&handle);
+        start_next(&handle);
     });
 }
-
-/// Records that a decision dialog was answered, so closing it does not log a cancellation.
-fn resolve(app: &Rc<App>) { app.state.borrow_mut().decision_open = false; }
 
 /// Asks whether an existing installation should be replaced or kept alongside the new one.
 fn ask_existing(app: &Rc<App>, path: PathBuf) {
@@ -1014,13 +1019,11 @@ fn ask_existing(app: &Rc<App>, path: PathBuf) {
     dialog.set_close_response("cancel");
 
     let handle = app.clone();
-    dialog.connect_response(None, move |_, response| {
-        let choice = match response { "replace" => ExistingChoice::Replace, "keep" => ExistingChoice::KeepBoth, _ => return };
-        resolve(&handle);
+    hold_queue(app, &dialog, "Installation cancelled.", move |response| {
+        let choice = match response { "replace" => ExistingChoice::Replace, "keep" => ExistingChoice::KeepBoth, _ => return false };
         start_worker(&handle, path.clone(), choice, None, Policy::Enforce);
+        true
     });
-
-    hold_queue(app, &dialog, "Installation cancelled.");
     dialog.present(Some(&app.window));
 }
 
@@ -1033,6 +1036,9 @@ fn ask_launcher(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, policy: Po
     dialog.add_response("cancel", "Cancel Installation");
     dialog.set_close_response("cancel");
 
+    // Rows are not response buttons: one records its launcher and closes the dialog, which libadwaita
+    // reports as the close response, so `hold_queue` settles every outcome in the same place.
+    let chosen: Rc<RefCell<Option<PathBuf>>> = Rc::default();
     let list = gtk::ListBox::new();
     list.add_css_class("boxed-list");
     list.set_selection_mode(gtk::SelectionMode::None);
@@ -1043,20 +1049,24 @@ fn ask_launcher(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, policy: Po
             .activatable(true)
             .build();
         row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-        let handle = app.clone();
-        let dialog = dialog.clone();
-        let source = path.clone();
+        // Weak, because the row lives inside the dialog: a strong reference would keep it alive.
+        let dialog = dialog.downgrade();
+        let chosen = chosen.clone();
         let selected = candidate.relative_path.clone();
         row.connect_activated(move |_| {
-            resolve(&handle);
-            dialog.close();
-            start_worker(&handle, source.clone(), choice, Some(selected.clone()), policy);
+            chosen.replace(Some(selected.clone()));
+            if let Some(dialog) = dialog.upgrade() { dialog.close(); }
         });
         list.append(&row);
     }
     dialog.set_extra_child(Some(&gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).max_content_height(320).propagate_natural_height(true).margin_top(6).child(&list).build()));
 
-    hold_queue(app, &dialog, "Installation cancelled while choosing a launcher.");
+    let handle = app.clone();
+    hold_queue(app, &dialog, "Installation cancelled while choosing a launcher.", move |_| {
+        let Some(selected) = chosen.take() else { return false };
+        start_worker(&handle, path.clone(), choice, Some(selected), policy);
+        true
+    });
     dialog.present(Some(&app.window));
 }
 
@@ -1081,16 +1091,14 @@ fn ask_override(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, reason: St
 
     let handle = app.clone();
     let approved = match &risk { Some(risk) => format!("Approved at {} risk; retrying with safety checks overridden.", risk.level), None => "Retrying with safety checks overridden at your request.".into() };
-    dialog.connect_response(None, move |_, response| {
+    hold_queue(app, &dialog, "Installation blocked by safety checks.", move |response| {
         let decision = if response == "override" { Decision::Approve } else { Decision::Deny };
-        // Denial needs no work here: `hold_queue` logs it and moves on, exactly as before.
-        let Some(policy) = decision.retry_policy() else { return };
-        resolve(&handle);
+        // Denial starts nothing: `hold_queue` logs it and moves on, exactly as before.
+        let Some(policy) = decision.retry_policy() else { return false };
         handle.state.borrow_mut().log.push(approved.clone());
         start_worker(&handle, path.clone(), choice, None, policy);
+        true
     });
-
-    hold_queue(app, &dialog, "Installation blocked by safety checks.");
     dialog.present(Some(&app.window));
 }
 
@@ -1173,4 +1181,108 @@ fn startup_check_due(record: &InstalledRecord, interval: UpdateInterval) -> bool
     let seconds = match interval { UpdateInterval::Daily => 86_400, UpdateInterval::Weekly => 604_800, UpdateInterval::Monthly => 2_592_000, UpdateInterval::Never => return false };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     record.last_update_check.map(|last| now.saturating_sub(last) >= seconds).unwrap_or(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, path::Path};
+    use crate::test_support::{self, entries, with_sandbox_home, Member::*, FAKE_ELF};
+
+    /// Depth-first search of `root`'s widget tree, libadwaita's internal children included.
+    fn find<W: IsA<gtk::Widget>, F: Fn(&W) -> bool>(root: &gtk::Widget, matches: &F) -> Option<W> {
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Some(found) = widget.downcast_ref::<W>().filter(|candidate| matches(candidate)) { return Some(found.clone()); }
+            if let Some(found) = find(&widget, matches) { return Some(found); }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    /// The alert shown over the window, if its heading or body mentions `text`.
+    fn dialog_about(app: &App, text: &str) -> Option<adw::AlertDialog> {
+        app.window.visible_dialog().and_downcast::<adw::AlertDialog>().filter(|dialog| dialog.heading().is_some_and(|heading| heading.contains(text)) || dialog.body().contains(text))
+    }
+
+    /// Presses the dialog's own response button, which closes the dialog *before* emitting `response`.
+    fn click(dialog: &adw::AlertDialog, label: &str) -> Result<(), String> {
+        find::<gtk::Button, _>(dialog.upcast_ref(), &|button| button.label().as_deref() == Some(label)).ok_or_else(|| format!("no “{label}” button"))?.emit_clicked();
+        Ok(())
+    }
+
+    /// Lets the main loop run (workers report through the window's own `tick`) until `ready` yields,
+    /// and gives up after 20 seconds so a regression fails instead of hanging.
+    async fn wait_for<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> Result<T, String> {
+        for _ in 0..400 {
+            if let Some(value) = ready() { return Ok(value); }
+            glib::timeout_future(Duration::from_millis(50)).await;
+        }
+        Err(format!("timed out waiting for {what}"))
+    }
+
+    /// What a driven run reports once the application quits: the final log, or why it failed.
+    type Outcome = Result<Vec<String>, String>;
+
+    /// Answers each dialog the queue raises: approve, Escape, a launcher row, then Keep Both.
+    async fn drive(app: &Rc<App>, home: &Path, archives: Vec<PathBuf>) -> Result<(), String> {
+        enqueue(app, archives);
+        let first = wait_for("the risk prompt for One.tar", || dialog_about(app, "“One.tar”")).await?;
+        click(&first, "Trust and Install")?;
+        // A `closed` handler used to release the queue here, so Two.tar started and was then
+        // overwritten by the approved retry: its result was dropped and this prompt never came.
+        let second = wait_for("the risk prompt for Two.tar", || dialog_about(app, "“Two.tar”")).await?;
+        if !home.join("Applications/One").is_dir() { return Err("Two.tar was prompted before the approved One.tar finished".into()); }
+        // Escape takes this path: libadwaita reports it as the close response.
+        second.close();
+        let chooser = wait_for("the launcher chooser for Pair.tar", || dialog_about(app, "Choose Application Launcher")).await?;
+        let row = find::<adw::ActionRow, _>(chooser.upcast_ref(), &|row| row.title() == "alpha").ok_or("no launcher row for alpha")?;
+        adw::prelude::ActionRowExt::activate(&row);
+        let existing = wait_for("the existing-install prompt for the second One.tar", || dialog_about(app, "Already Installed")).await?;
+        click(&existing, "Keep Both")?;
+        wait_for("the queue to drain", || { let state = app.state.borrow(); (state.queue.is_empty() && state.receiver.is_none() && !state.decision_open).then_some(()) }).await
+    }
+
+    /// Drives the real window with libadwaita's own buttons, rows, and close path, so the signals
+    /// fire in their real order. Run with `cargo test -- --ignored`, under `xvfb-run` to keep the
+    /// window off screen.
+    #[test]
+    #[ignore = "opens a window, so it needs a display"]
+    fn answered_dialogs_hold_the_queue_until_their_work_reports_back() {
+        with_sandbox_home(|home| {
+            let downloads = home.join("Downloads");
+            fs::create_dir_all(downloads.join("again")).unwrap();
+            let archives = vec![
+                test_support::tar(&downloads, "One.tar", &[File("One/one", FAKE_ELF, 0o755), File("One/lib/a.so.1", b"a", 0o644), Symlink("One/lib/a.so", "a.so.1"), Symlink("One/lib/b.so", "a.so.1")]),
+                test_support::tar(&downloads, "Two.tar", &[File("Two/two", FAKE_ELF, 0o755), Symlink("Two/run", "two")]),
+                test_support::tar(&downloads, "Pair.tar", &[File("Pair/alpha", FAKE_ELF, 0o755), File("Pair/beta", FAKE_ELF, 0o755)]),
+                test_support::tar(&downloads, "Three.tar", &[File("Three/three", FAKE_ELF, 0o755)]),
+                test_support::tar(&downloads.join("again"), "One.tar", &[File("One/one", FAKE_ELF, 0o755)]),
+            ];
+            let application = adw::Application::builder().flags(gio::ApplicationFlags::NON_UNIQUE).build();
+            let outcome: Rc<RefCell<Option<Outcome>>> = Rc::default();
+            let (result, root) = (outcome.clone(), home.to_path_buf());
+            application.connect_activate(move |application| {
+                if let Some(settings) = gtk::Settings::default() { settings.set_gtk_enable_animations(false); }
+                let app = build(application);
+                let (application, result, root, archives) = (application.clone(), result.clone(), root.clone(), archives.clone());
+                // Nothing may panic in here: it would unwind through GLib. Failures come back as text.
+                glib::spawn_future_local(async move {
+                    let driven = drive(&app, &root, archives).await;
+                    *result.borrow_mut() = Some(driven.map(|()| app.state.borrow().log.clone()));
+                    application.quit();
+                });
+            });
+            application.run_with_args::<&str>(&[]);
+
+            let log = outcome.take().expect("the application never activated").unwrap_or_else(|error| panic!("{error}"));
+            let count = |line: &str| log.iter().filter(|entry| entry.as_str() == line).count();
+            assert_eq!(count("Installation blocked by safety checks."), 1, "only the dismissed Two.tar prompt is a cancellation: {log:#?}");
+            assert_eq!(count("Installation cancelled while choosing a launcher."), 0, "{log:#?}");
+            assert_eq!(count("Installation cancelled."), 0, "{log:#?}");
+            let approved = log.iter().position(|entry| entry.starts_with("Approved at Medium risk")).expect("approval logged");
+            assert!(log.iter().position(|entry| entry == "Installation blocked by safety checks.").is_some_and(|blocked| blocked > approved), "{log:#?}");
+            assert_eq!(entries(&home.join("Applications")), ["Alpha", "One", "One (2)", "Three"]);
+        });
+    }
 }
