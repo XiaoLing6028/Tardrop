@@ -9,6 +9,8 @@ mod desktop;
 mod icons;
 mod installer;
 mod security;
+#[cfg(test)]
+mod test_support;
 mod ui;
 mod updates;
 mod utils;

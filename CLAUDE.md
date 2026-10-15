@@ -16,14 +16,18 @@ cargo build --release     # release build (LTO, codegen-units=1, stripped)
 ./target/release/tardrop
 cargo check               # fastest way to validate a change
 cargo clippy
+cargo test                # unit tests (needs the same GTK/libadwaita dev packages: it's a bin crate)
 ```
 
 Requires GTK 4 and libadwaita **development** packages on the system (the bindings link against
 them): `sudo dnf install gtk4-devel libadwaita-devel` on Fedora, `libgtk-4-dev libadwaita-1-dev`
 on Debian/Ubuntu. Rust edition 2024, so a recent stable toolchain is needed.
 
-There is currently **no test suite** — no `#[test]` anywhere in `src/`. `cargo test` is a no-op.
-Verification is done by running the app against real archives.
+Unit tests live in `#[cfg(test)] mod tests` blocks in `security`, `archive`, and `installer`.
+`test_support` (test-only) builds real tar/zip archives with the same crates the extractor reads. Tests
+that call `installer::install` use `with_sandbox_home`, which re-executes the test binary with `HOME`
+pointed at a tempdir: `std::env::set_var` is `unsafe` in edition 2024 and the crate forbids unsafe, so
+never mutate the environment in-process. The UI has no tests; verify it by running the app.
 
 ## Architecture
 
@@ -38,14 +42,19 @@ extraction, and publication live in the installer modules. Keep it that way when
 - `archive` — extension-based format detection and streaming extraction. Never shells out to
   `tar`/`unzip`. `safe_destination` rejects any component that is not `Component::Normal`, and only
   regular files and directories are written; symlinks, hardlinks, and device nodes are hard errors.
-- `installer` — the extract → inspect → publish transaction (`install()`). Extraction goes into a
+  `survey` is a read-only pass over member headers that collects every link and `install.sh` and
+  decides whether each link escapes the package folder, following the archive's own symlinks.
+- `installer` — the survey → extract → inspect → publish transaction (`install()`). Under
+  `Policy::Enforce` a survey with links or `install.sh` refuses before any write, with a
+  `RiskAssessment` attached to the `Rejected`. Extraction goes into a
   `.tardrop-*` tempdir *inside* `~/Applications` so the final publish is a same-filesystem
   `fs::rename`. Launcher selection is a scoring pass (`executable_candidates` / `candidate_penalty`)
   over root `AppRun`, `Exec=` targets from nearby desktop files, launcher scripts, and root
   executables; when the top two scores are within 10 points it returns
   `InstallResult::NeedsLauncherChoice` instead of guessing, and the UI asks the user.
 - `security` — archive SHA-256, ELF magic check (`is_elf`; scripts are never launchers by design),
-  and `safe_desktop_value` for desktop-entry injection.
+  `safe_desktop_value` for desktop-entry injection, and the risk tiers (`RiskAssessment::of`) plus the
+  `Decision` → `Policy` mapping the override prompt uses.
 - `desktop` — reads package `.desktop` metadata and writes the per-user launcher, then
   `refresh_integrations()`.
 - `icons` — picks a PNG/SVG/XPM icon without following links; icons are *copied* into XDG data so
@@ -76,5 +85,6 @@ extraction, and publication live in the installer modules. Keep it that way when
 - Strictness over convenience is intentional. Archives that ordinary tools accept are rejected here
   because the input is assumed untrusted — do not relax a validation to make an archive work.
   The one sanctioned escape hatch is user-initiated: content-check failures are raised as
-  `security::Rejected`, and the UI offers a retry with `Policy::Override`. Traversal/absolute paths
+  `security::Rejected`, and the UI offers a retry with `Policy::Override`. Survey refusals (links,
+  `install.sh`) carry `Rejected::risk`, which the prompt shows as a level plus reasons. Traversal/absolute paths
   stay unwritable even then. New checks should return `Rejected` so they participate in this flow.

@@ -29,7 +29,7 @@ use gtk4::{gdk, gio, glib};
 
 use crate::{
     installer::{self, ExistingChoice, InstallResult, InstalledApp, LauncherCandidate},
-    security::{Policy, Rejected},
+    security::{Decision, Policy, Rejected, RiskAssessment, RiskLevel},
     updates::{self, InstalledDatabase, InstalledRecord, ReleaseInfo, UpdateInterval, UpdateSettings},
     utils,
 };
@@ -40,6 +40,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Release notes are shown in a dialog body, so they are trimmed to keep the buttons reachable.
 const NOTES_LIMIT: usize = 700;
+
+/// Flagged members listed in the risk prompt before the rest are summarised as a count, for the
+/// same reason: an archive with hundreds of links must not push the decision off screen.
+const RISK_DETAILS_LIMIT: usize = 6;
 
 /// The only styling libadwaita does not already provide: the drop surface, which has no stock
 /// equivalent. The colours are named Adwaita variables, so the accent follows the user's choice.
@@ -656,7 +660,8 @@ fn poll_worker(app: &Rc<App>) {
         // Only a content-check refusal is overridable, and only once: an overridden install that
         // still fails reports the error normally instead of offering the same choice again.
         Err(error) if policy == Policy::Enforce && path.is_some() && error.downcast_ref::<Rejected>().is_some() => {
-            if let Some(path) = path { ask_override(app, path, choice, format!("{error:#}")); }
+            let risk = error.downcast_ref::<Rejected>().and_then(|rejected| rejected.risk.clone());
+            if let Some(path) = path { ask_override(app, path, choice, format!("{error:#}"), risk); }
         }
         Err(error) => show_error(app, format!("Installation failed: {error:#}")),
     }
@@ -1056,13 +1061,18 @@ fn ask_launcher(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, policy: Po
 }
 
 /// Explains why an archive was refused and lets the user decide whether to trust it anyway.
-/// Refusing is the default and the close response; overriding is styled as destructive.
-fn ask_override(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, reason: String) {
+/// A survey refusal leads with its risk level and the members behind it; any other refusal quotes
+/// its reason. Refusing is the default and the close response; overriding is styled as destructive.
+fn ask_override(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, reason: String, risk: Option<RiskAssessment>) {
     let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-    let dialog = adw::AlertDialog::builder()
-        .heading("Installation Blocked")
-        .body(format!("“{name}” did not pass TarDrop’s safety checks:\n\n{reason}\n\nOnly continue if you trust where this archive came from. Files that would land outside the application’s own folder are skipped either way."))
-        .build();
+    let caution = "Only continue if you trust where this archive came from. Nothing in it is run, and files that would land outside the application’s own folder are skipped either way.";
+    // With a risk assessment, the caution follows it, so the level is the first thing read.
+    let body = match risk {
+        Some(_) => format!("“{name}” contains links or an install script, which TarDrop does not install by default."),
+        None => format!("“{name}” did not pass TarDrop’s safety checks:\n\n{reason}\n\n{caution}"),
+    };
+    let dialog = adw::AlertDialog::builder().heading(if risk.is_some() { "Review Installation Risk" } else { "Installation Blocked" }).body(body).build();
+    if let Some(risk) = &risk { dialog.set_extra_child(Some(&risk_summary(risk, caution))); }
     dialog.add_response("cancel", "Don’t Install");
     dialog.add_response("override", "Trust and Install");
     dialog.set_response_appearance("override", adw::ResponseAppearance::Destructive);
@@ -1070,15 +1080,47 @@ fn ask_override(app: &Rc<App>, path: PathBuf, choice: ExistingChoice, reason: St
     dialog.set_close_response("cancel");
 
     let handle = app.clone();
+    let approved = match &risk { Some(risk) => format!("Approved at {} risk; retrying with safety checks overridden.", risk.level), None => "Retrying with safety checks overridden at your request.".into() };
     dialog.connect_response(None, move |_, response| {
-        if response != "override" { return; }
+        let decision = if response == "override" { Decision::Approve } else { Decision::Deny };
+        // Denial needs no work here: `hold_queue` logs it and moves on, exactly as before.
+        let Some(policy) = decision.retry_policy() else { return };
         resolve(&handle);
-        handle.state.borrow_mut().log.push("Retrying with safety checks overridden at your request.".into());
-        start_worker(&handle, path.clone(), choice, None, Policy::Override);
+        handle.state.borrow_mut().log.push(approved.clone());
+        start_worker(&handle, path.clone(), choice, None, policy);
     });
 
     hold_queue(app, &dialog, "Installation blocked by safety checks.");
     dialog.present(Some(&app.window));
+}
+
+/// The level and reason line, coloured by libadwaita's semantic classes, above the flagged members
+/// and the caution. Labels are plain text, so member names from the archive cannot inject markup.
+fn risk_summary(risk: &RiskAssessment, caution: &str) -> gtk::Box {
+    let summary = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let level = gtk::Label::new(Some(&risk.summary()));
+    level.add_css_class("heading");
+    level.add_css_class(match risk.level { RiskLevel::Low => "success", RiskLevel::Medium => "warning", RiskLevel::High => "error" });
+    level.set_wrap(true);
+    level.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    level.set_justify(gtk::Justification::Center);
+    summary.append(&level);
+    if !risk.details.is_empty() {
+        let mut lines: Vec<String> = risk.details.iter().take(RISK_DETAILS_LIMIT).cloned().collect();
+        if risk.details.len() > RISK_DETAILS_LIMIT { lines.push(format!("…and {} more in the technical log", risk.details.len() - RISK_DETAILS_LIMIT)); }
+        let details = gtk::Label::new(Some(&lines.join("\n")));
+        details.add_css_class("caption");
+        details.add_css_class("dim-label");
+        details.set_wrap(true);
+        details.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        details.set_xalign(0.0);
+        summary.append(&details);
+    }
+    let note = gtk::Label::new(Some(caution));
+    note.set_wrap(true);
+    note.set_justify(gtk::Justification::Center);
+    summary.append(&note);
+    summary
 }
 
 /// Presents a found release together with whatever notes the provider published, and offers the

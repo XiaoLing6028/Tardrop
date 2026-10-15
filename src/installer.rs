@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, fs, path::{Component, Path, PathBuf}};
 use anyhow::{bail, Context, Result};
 use tempfile::Builder;
 use walkdir::WalkDir;
-use crate::{archive, desktop, icons, security::{self, Policy}, updates, utils};
+use crate::{archive, desktop, icons, security::{self, Policy, RiskAssessment}, updates, utils};
 
 /// A completed installation, retained by the UI for launch/open/uninstall actions.
 #[derive(Clone, Debug)]
@@ -24,11 +24,22 @@ pub enum InstallResult { Installed(InstalledApp), NeedsLauncherChoice(Vec<Launch
 
 /// Installs an archive only below `~/Applications`; all public changes happen after inspection.
 /// Content-check failures surface as `security::Rejected`; `Policy::Override` relaxes them on request.
+/// Links and `install.sh` are surveyed before anything is written, so their refusal carries a
+/// `RiskAssessment` of the whole archive and leaves not even a staging directory behind.
 pub fn install(source: &Path, choice: ExistingChoice, selected_launcher: Option<&Path>, policy: Policy, log: &mut Vec<String>) -> Result<InstallResult> {
     let format = archive::detect(source)?;
     let hash = security::archive_sha256(source)?;
     let base_name = utils::archive_stem(source);
     log.push(format!("Validated archive SHA-256: {hash}"));
+    if policy == Policy::Enforce {
+        let findings = archive::survey(source, format)?;
+        if findings.blocks() {
+            let risk = RiskAssessment::of(&findings);
+            log.push(format!("Archive needs your approval. Risk: {}", risk.summary()));
+            log.extend(risk.details.iter().map(|detail| format!("  {detail}")));
+            return Err(security::Rejected::from(risk).into());
+        }
+    }
     let applications = utils::applications_dir()?;
     let staging = Builder::new().prefix(".tardrop-").tempdir_in(&applications).context("could not make private staging directory")?;
     log.push("Extracting archive into private staging directory…".into());
@@ -40,7 +51,7 @@ pub fn install(source: &Path, choice: ExistingChoice, selected_launcher: Option<
         Some(relative) => candidates.iter().find(|candidate| candidate.relative_path == relative)
             .map(|candidate| extracted_root.join(&candidate.relative_path))
             .ok_or_else(|| anyhow::anyhow!("selected launcher is no longer a safe candidate"))?,
-        None if candidates.is_empty() && policy == Policy::Enforce => return Err(security::Rejected("No safe application launcher was found.".into()).into()),
+        None if candidates.is_empty() && policy == Policy::Enforce => return Err(security::Rejected::new("No safe application launcher was found.").into()),
         None if candidates.is_empty() => bail!("The archive contains no executable file to launch."),
         None if candidates.len() > 1 && candidates[0].score - candidates[1].score <= 10 => {
             log.push("Top launcher candidates are too close to choose safely; asking you to decide.".into());
@@ -148,6 +159,8 @@ fn executable_candidates(root: &Path, archive_name: &str, policy: Policy) -> Res
         let path = item.path();
         if !is_executable(path) { continue; }
         let filename = item.file_name().to_string_lossy().to_ascii_lowercase();
+        // An installer script is never a launcher, even after the user overrides the checks.
+        if filename == "install.sh" { continue; }
         let is_native_binary = security::is_elf(path);
         // Scripts are candidates only when their names clearly identify them as launchers.
         let is_launcher_script = filename.starts_with("start-") || filename.starts_with("launch-") || filename.starts_with("run-") || filename.ends_with(".sh");
@@ -242,4 +255,109 @@ pub fn uninstall(app: &InstalledApp) -> Result<()> {
     desktop::refresh_integrations();
     updates::record_removal(&app.directory).context("application files were removed, but database cleanup failed")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use crate::{security::{Decision, Rejected, RiskLevel}, test_support::{self, Member::*, FAKE_ELF}};
+
+    /// Runs `body` with HOME pointing at a fresh directory, so installs never reach the real
+    /// `~/Applications`. The test re-executes itself as a child process: changing HOME in-process
+    /// needs `std::env::set_var`, which is `unsafe` in edition 2024 and forbidden in this crate.
+    fn with_sandbox_home(test: &str, body: impl FnOnce(&Path)) {
+        const MARKER: &str = "TARDROP_TEST_HOME";
+        if let Some(home) = std::env::var_os(MARKER) { return body(Path::new(&home)); }
+        let home = tempfile::tempdir().unwrap();
+        let module = module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest);
+        let name = format!("{module}::{test}");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(MARKER, home.path()).env("HOME", home.path())
+            .env_remove("XDG_DATA_HOME").env_remove("XDG_CONFIG_HOME").env_remove("XDG_CACHE_HOME")
+            // `refresh_integrations` runs desktop-cache tools that would act on the real session.
+            .env("PATH", home.path().join("no-tools"))
+            .output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && stdout.contains("1 passed"), "sandboxed run of {name} failed:\n{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    /// Names inside `directory`, or nothing when it does not exist.
+    fn entries(directory: &Path) -> Vec<String> {
+        fs::read_dir(directory).map(|items| items.filter_map(Result::ok).map(|item| item.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
+    }
+
+    fn refusal_risk(error: &anyhow::Error) -> security::RiskAssessment {
+        error.downcast_ref::<Rejected>().and_then(|rejected| rejected.risk.clone()).unwrap_or_else(|| panic!("expected a risk-assessed refusal, got: {error:#}"))
+    }
+
+    #[test]
+    fn denying_the_risk_prompt_changes_nothing_and_approving_installs() {
+        with_sandbox_home("denying_the_risk_prompt_changes_nothing_and_approving_installs", |home| {
+            let archive = test_support::tar(home, "demo.tar", &[
+                Dir("Demo"), File("Demo/demo", FAKE_ELF, 0o755), File("Demo/lib/libdemo.so.1", b"lib", 0o644),
+                Symlink("Demo/lib/libdemo.so", "libdemo.so.1"), Symlink("Demo/fonts", "/usr/share/fonts"),
+            ]);
+            let mut log = Vec::new();
+            let error = install(&archive, ExistingChoice::KeepBoth, None, Policy::Enforce, &mut log).unwrap_err();
+            let risk = refusal_risk(&error);
+            assert_eq!(risk.level, RiskLevel::Medium);
+            assert_eq!(risk.summary(), "Medium — 1 symlink escapes the package, 1 symlink inside the package");
+            assert!(log.iter().any(|line| line.ends_with(&risk.summary())), "{log:?}");
+
+            // Deny retries nothing, and the refusal happened before any write: same as before.
+            assert_eq!(Decision::Deny.retry_policy(), None);
+            assert_eq!(entries(&home.join("Applications")), Vec::<String>::new());
+            assert_eq!(entries(&home.join(".local/share/applications")), Vec::<String>::new());
+            assert!(!home.join(".local/share/tardrop/installed-apps.json").exists());
+
+            // Approve retries the same archive under Override, keeping its links.
+            let policy = Decision::Approve.retry_policy().unwrap();
+            let InstallResult::Installed(app) = install(&archive, ExistingChoice::KeepBoth, None, policy, &mut log).unwrap() else { panic!("expected an installation") };
+            assert_eq!(app.directory, home.join("Applications/Demo"));
+            assert_eq!(app.executable, app.directory.join("demo"));
+            assert_eq!(fs::read_link(app.directory.join("lib/libdemo.so")).unwrap(), Path::new("libdemo.so.1"));
+            assert_eq!(fs::read_link(app.directory.join("fonts")).unwrap(), Path::new("/usr/share/fonts"));
+            assert!(app.desktop_file.starts_with(home) && app.desktop_file.exists());
+            assert_eq!(entries(&home.join("Applications")), ["Demo"], "the staging directory must be gone");
+        });
+    }
+
+    #[test]
+    fn install_sh_is_refused_as_high_risk_and_never_becomes_the_launcher() {
+        with_sandbox_home("install_sh_is_refused_as_high_risk_and_never_becomes_the_launcher", |home| {
+            let archive = test_support::tar(home, "tool.tar", &[File("Tool/tool", FAKE_ELF, 0o755), File("Tool/install.sh", b"#!/bin/sh\nexit 1\n", 0o755)]);
+            let error = install(&archive, ExistingChoice::KeepBoth, None, Policy::Enforce, &mut Vec::new()).unwrap_err();
+            assert_eq!(refusal_risk(&error).summary(), "High — install.sh script found (1)");
+            assert_eq!(entries(&home.join("Applications")), Vec::<String>::new());
+
+            let policy = Decision::Approve.retry_policy().unwrap();
+            let InstallResult::Installed(app) = install(&archive, ExistingChoice::KeepBoth, None, policy, &mut Vec::new()).unwrap() else { panic!("expected an installation") };
+            assert_eq!(app.executable, app.directory.join("tool"));
+            assert!(app.directory.join("install.sh").is_file(), "the script is installed as an ordinary file");
+        });
+    }
+
+    #[test]
+    fn clean_archive_installs_without_a_prompt() {
+        with_sandbox_home("clean_archive_installs_without_a_prompt", |home| {
+            let archive = test_support::tar(home, "clean.tar", &[Dir("Clean"), File("Clean/clean", FAKE_ELF, 0o755), File("Clean/README", b"hi", 0o644)]);
+            let result = install(&archive, ExistingChoice::KeepBoth, None, Policy::Enforce, &mut Vec::new()).unwrap();
+            assert!(matches!(result, InstallResult::Installed(ref app) if app.directory == home.join("Applications/Clean")), "{result:?}");
+        });
+    }
+
+    #[test]
+    fn install_sh_is_never_a_launcher_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, data) in [("app", FAKE_ELF), ("install.sh", b"#!/bin/sh\n".as_slice()), ("run-app.sh", b"#!/bin/sh\n".as_slice())] {
+            fs::write(root.path().join(name), data).unwrap();
+            #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(root.path().join(name), fs::Permissions::from_mode(0o755)).unwrap(); }
+        }
+        for policy in [Policy::Enforce, Policy::Override] {
+            let names: Vec<_> = executable_candidates(root.path(), "app", policy).unwrap().into_iter().map(|candidate| candidate.relative_path).collect();
+            assert_eq!(names, [PathBuf::from("run-app.sh"), PathBuf::from("app")], "{policy:?}");
+        }
+    }
 }
