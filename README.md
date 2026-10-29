@@ -47,6 +47,17 @@ cargo build --release
 
 For development, use `cargo run`; `cargo test` runs the unit tests. Cargo downloads the Rust dependencies on the first build. The GTK 4 and libadwaita development packages must be installed first, because the bindings link against the system libraries.
 
+## AppImage
+
+A self-contained x86_64 AppImage runs on distributions with glibc 2.39 or newer (Ubuntu 24.04, Debian 13, Fedora 40, and later) without GTK or libadwaita installed. It is built in a pinned container, so Docker or Podman is the only host requirement:
+
+```bash
+packaging/appimage/build.sh        # writes dist/TarDrop-<version>-x86_64.AppImage and its .sha256
+packaging/appimage/smoke-test.sh   # static checks, then end-to-end runs on several distributions
+```
+
+See [packaging/appimage/README.md](packaging/appimage/README.md) for what is bundled, how every download is pinned and verified, and the known limitations.
+
 ## Architecture
 
 * `archive`: identifies formats and performs streaming, validated extraction.

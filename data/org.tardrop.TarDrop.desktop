@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=TarDrop
+GenericName=Portable App Installer
+Comment=Install portable application archives into your home folder
+Keywords=archive;tarball;tar;zip;portable;install;
+# TarDrop takes no command-line arguments: archives are dropped onto or opened from its window.
+Exec=tardrop
+Icon=org.tardrop.TarDrop
+Terminal=false
+Categories=System;PackageManager;
+StartupNotify=true

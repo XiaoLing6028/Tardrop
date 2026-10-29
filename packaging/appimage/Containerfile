@@ -1,0 +1,61 @@
+# check=skip=InvalidDefaultArgInFrom
+# (BASE_IMAGE deliberately has no default: build.sh passes the digest pinned in pins.env.)
+#
+# Build environment for TarDrop's AppImage. Built and run by build.sh; see README.md.
+#
+# The AppImage runs on any x86_64 system whose glibc is at least the one it was built against, so
+# the image is Ubuntu 24.04 (glibc 2.39). Its GTK 4.14 and libadwaita 1.5 are older than TarDrop
+# needs, so install-gtk.sh builds those two from pinned upstream releases; every other package is
+# taken from a dated Ubuntu archive snapshot, so rebuilding the image installs the same versions.
+#
+# Every download needs the host's CA bundle, passed as the build secret "cacert": a secret is
+# mounted only while one RUN step executes and never becomes part of an image layer.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+
+COPY pins.env /opt/tardrop/pins.env
+# apt downloads as the unprivileged _apt user, hence the world-readable secret mount.
+RUN --mount=type=secret,id=cacert,required=true,mode=0444 \
+    source /opt/tardrop/pins.env && \
+    rm -f /etc/apt/sources.list.d/ubuntu.sources && \
+    printf 'Types: deb\nURIs: https://snapshot.ubuntu.com/ubuntu/%s/\nSuites: noble noble-updates noble-security\nComponents: main universe\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+        "$UBUNTU_SNAPSHOT" > /etc/apt/sources.list.d/snapshot.sources && \
+    echo 'Acquire::https::CAInfo "/run/secrets/cacert";' > /etc/apt/apt.conf.d/50tardrop-ca && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        `# toolchain and build tools` \
+        build-essential pkg-config meson ninja-build cmake python3 gettext sassc \
+        ca-certificates curl gnupg xz-utils file \
+        `# GTK 4.16 and libadwaita 1.6 build dependencies` \
+        libglib2.0-dev libglib2.0-dev-bin libpango1.0-dev libcairo2-dev libgdk-pixbuf-2.0-dev \
+        libharfbuzz-dev libfribidi-dev libepoxy-dev libgraphene-1.0-dev libxkbcommon-dev \
+        libwayland-dev libwayland-bin libdrm-dev libpng-dev libjpeg-dev libtiff-dev \
+        libx11-dev libxext-dev libxi-dev libxrandr-dev libxcursor-dev libxdamage-dev \
+        libxfixes-dev libxinerama-dev libappstream-dev \
+        `# runtime pieces copied into the AppDir` \
+        librsvg2-common dconf-gsettings-backend shared-mime-info adwaita-icon-theme hicolor-icon-theme \
+        `# metadata checks and the PNG icon` \
+        desktop-file-utils appstream librsvg2-bin \
+        `# a display, a session bus, and OpenGL for TarDrop's window test` \
+        xvfb xauth dbus dbus-x11 at-spi2-core libgl1-mesa-dri libegl-mesa0 libgles2 && \
+    rm -f /etc/apt/apt.conf.d/50tardrop-ca && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY image/fetch.sh image/install-gtk.sh /opt/tardrop/image/
+RUN --mount=type=secret,id=cacert,required=true /opt/tardrop/image/install-gtk.sh
+
+COPY image/install-rust.sh /opt/tardrop/image/
+RUN --mount=type=secret,id=cacert,required=true /opt/tardrop/image/install-rust.sh
+
+COPY keys/type2-runtime.asc /opt/tardrop/keys/
+COPY image/install-tools.sh /opt/tardrop/image/
+RUN --mount=type=secret,id=cacert,required=true /opt/tardrop/image/install-tools.sh
+
+ENV PATH=/opt/rust/bin:/opt/gtk/bin:$PATH \
+    CARGO_HOME=/opt/cargo \
+    PKG_CONFIG_PATH=/opt/gtk/lib/pkgconfig:/opt/gtk/share/pkgconfig \
+    XDG_DATA_DIRS=/opt/gtk/share:/usr/local/share:/usr/share

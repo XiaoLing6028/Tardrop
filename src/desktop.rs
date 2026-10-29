@@ -1,8 +1,8 @@
 //! Freedesktop desktop-entry metadata, writing, and desktop-cache refreshes.
 
-use std::{fs, path::{Path, PathBuf}, process::Command};
+use std::{fs, path::{Path, PathBuf}};
 use anyhow::{Context, Result};
-use crate::{security::safe_desktop_value, utils};
+use crate::{host, security::safe_desktop_value, utils};
 
 /// Safe, optional metadata read from a package's desktop entry.
 #[derive(Clone, Debug, Default)]
@@ -74,7 +74,7 @@ fn quote_argument(path: &Path) -> String { format!("\"{}\"", path.to_string_loss
 pub fn refresh_integrations() {
     let applications = utils::applications_database_dir().unwrap_or_default();
     let icon_root = dirs::data_local_dir().unwrap_or_default().join("icons");
-    let _ = Command::new("update-desktop-database").arg(applications).status();
-    let _ = Command::new("gtk-update-icon-cache").args(["-f", "-t"]).arg(icon_root).status();
-    let _ = Command::new("kbuildsycoca6").status();
+    let _ = host::command("update-desktop-database").arg(applications).status();
+    let _ = host::command("gtk-update-icon-cache").args(["-f", "-t"]).arg(icon_root).status();
+    let _ = host::command("kbuildsycoca6").status();
 }

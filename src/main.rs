@@ -6,6 +6,7 @@
 
 mod archive;
 mod desktop;
+mod host;
 mod icons;
 mod installer;
 mod security;

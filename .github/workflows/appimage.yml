@@ -1,0 +1,52 @@
+# Builds TarDrop's x86_64 AppImage in the pinned build container, runs the unit tests against the
+# GTK and libadwaita it bundles, smoke-tests the result on several distributions and against a
+# native build, and uploads the AppImage with its checksum as a workflow artifact.
+# Publishing a GitHub Release stays a manual step. See packaging/appimage/README.md.
+name: AppImage
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appimage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and unit-test in the pinned container
+        run: packaging/appimage/build.sh
+
+      - name: Smoke-test the AppImage
+        run: packaging/appimage/smoke-test.sh
+
+      - name: Upload the AppImage
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: TarDrop-AppImage-x86_64
+          path: |
+            dist/TarDrop-*-x86_64.AppImage
+            dist/TarDrop-*-x86_64.AppImage.sha256
+          if-no-files-found: error
+
+      - name: Upload the smoke-test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: appimage-smoke-reports
+          path: target/appimage-smoke/
+          if-no-files-found: ignore
