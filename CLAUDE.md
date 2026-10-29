@@ -17,6 +17,8 @@ cargo build --release     # release build (LTO, codegen-units=1, stripped)
 cargo check               # fastest way to validate a change
 cargo clippy
 cargo test                # unit tests (needs the same GTK/libadwaita dev packages: it's a bin crate)
+packaging/appimage/build.sh       # x86_64 AppImage into dist/, built and unit-tested in a pinned container
+packaging/appimage/smoke-test.sh  # static checks + end-to-end runs of that AppImage on several distros
 ```
 
 Requires GTK 4 and libadwaita **development** packages on the system (the bindings link against
@@ -61,6 +63,10 @@ extraction, and publication live in the installer modules. Keep it that way when
   `refresh_integrations()`.
 - `icons` — picks a PNG/SVG/XPM icon without following links; icons are *copied* into XDG data so
   they survive replacement of the install directory.
+- `host` — `host::command` builds every child process (installed apps, `xdg-open`, desktop-cache
+  tools). Inside the AppImage it restores the environment `packaging/appimage/AppRun` changed
+  (listed in `TARDROP_HOST_ENV`); natively it is a plain `Command`. Never spawn with
+  `Command::new` directly.
 - `utils` — the only place that resolves `~/Applications` and the XDG dir, plus `sanitize_name`,
   `desktop_id`, and `direct_child` (which enforces that a computed path is an immediate child of the
   owned root — uninstall relies on this).

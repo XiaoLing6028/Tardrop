@@ -1,0 +1,50 @@
+#!/bin/sh
+# Entry point of TarDrop's AppImage. The AppImage runtime mounts the image read-only at a random
+# path and runs this script from there, so everything bundled is located relative to it.
+#
+# Only what GTK needs to use the bundled files is changed, and nothing that alters behaviour:
+# GDK_BACKEND and GTK_THEME stay the desktop's, so TarDrop keeps native Wayland and follows the
+# light/dark preference and accent colour exactly as a native build does.
+#   XDG_DATA_DIRS           bundled icon themes (TarDrop pins Adwaita), GSettings schemas, and
+#                           MIME database (gdk-pixbuf recognises SVG icons through it)
+#   GDK_PIXBUF_MODULE_FILE  the bundled SVG image loader, instead of the host's loaders, which
+#                           are built against the host's own gdk-pixbuf
+#   GIO_MODULE_DIR          the bundled dconf GSettings backend, instead of the host's GIO
+#                           modules, which are built against the host's own GLib
+#   GDK_DISABLE             only on hosts without OpenGL ES (below)
+# Each prior value is saved as TARDROP_HOST_<NAME> (absent when it was unset), and every name,
+# plus the APPIMAGE/APPDIR/ARGV0/OWD the runtime sets, is listed in TARDROP_HOST_ENV. TarDrop puts
+# those back for every program it starts (src/host.rs), so xdg-open, the desktop-cache tools, and
+# installed applications never inherit the bundle.
+set -eu
+
+here=$(dirname "$(readlink -f "$0")")
+
+# Bookkeeping inherited from an outer TarDrop would restore the wrong values: start afresh.
+unset TARDROP_HOST_XDG_DATA_DIRS TARDROP_HOST_GDK_PIXBUF_MODULE_FILE TARDROP_HOST_GIO_MODULE_DIR \
+    TARDROP_HOST_GDK_DISABLE TARDROP_HOST_APPIMAGE TARDROP_HOST_APPDIR TARDROP_HOST_ARGV0 TARDROP_HOST_OWD
+if [ -n "${XDG_DATA_DIRS+set}" ]; then export TARDROP_HOST_XDG_DATA_DIRS="$XDG_DATA_DIRS"; fi
+if [ -n "${GDK_PIXBUF_MODULE_FILE+set}" ]; then export TARDROP_HOST_GDK_PIXBUF_MODULE_FILE="$GDK_PIXBUF_MODULE_FILE"; fi
+if [ -n "${GIO_MODULE_DIR+set}" ]; then export TARDROP_HOST_GIO_MODULE_DIR="$GIO_MODULE_DIR"; fi
+changed="XDG_DATA_DIRS GDK_PIXBUF_MODULE_FILE GIO_MODULE_DIR"
+
+# An unset or empty XDG_DATA_DIRS means the specification's default, which must stay searched.
+export XDG_DATA_DIRS="$here/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export GDK_PIXBUF_MODULE_FILE="$here/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+export GIO_MODULE_DIR="$here/usr/lib/gio/modules"
+
+# GTK 4.16 renders with OpenGL ES first, and libepoxy aborts the process when the host has no
+# libGLESv2.so.2 instead of letting GTK fall back. Every libglvnd install has it, but Debian and
+# Ubuntu ship it separately (libgles2); without it, GTK is told to use desktop OpenGL instead.
+gles=no
+for ldconfig in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
+    if "$ldconfig" -p 2> /dev/null | grep -q 'libGLESv2\.so\.2 (libc6,x86-64)'; then gles=yes; break; fi
+done
+if [ "$gles" = no ]; then
+    if [ -n "${GDK_DISABLE+set}" ]; then export TARDROP_HOST_GDK_DISABLE="$GDK_DISABLE"; fi
+    export GDK_DISABLE="${GDK_DISABLE:+$GDK_DISABLE,}gles-api"
+    changed="$changed GDK_DISABLE"
+fi
+
+export TARDROP_HOST_ENV="$changed APPIMAGE APPDIR ARGV0 OWD"
+exec "$here/usr/bin/tardrop" "$@"

@@ -17,7 +17,6 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     path::PathBuf,
-    process::Command,
     rc::Rc,
     sync::mpsc::{self, Receiver},
     time::Duration,
@@ -28,6 +27,7 @@ use gtk4 as gtk;
 use gtk4::{gdk, gio, glib};
 
 use crate::{
+    host,
     installer::{self, ExistingChoice, InstallResult, InstalledApp, LauncherCandidate},
     security::{Decision, Policy, Rejected, RiskAssessment, RiskLevel},
     updates::{self, InstalledDatabase, InstalledRecord, ReleaseInfo, UpdateInterval, UpdateSettings},
@@ -860,14 +860,14 @@ fn refresh_session_apps(app: &Rc<App>) {
 
         let launch = row_button("media-playback-start-symbolic", "Start this application now.");
         let executable = installed.executable.clone();
-        launch.connect_clicked(move |_| { let _ = Command::new(&executable).spawn(); });
+        launch.connect_clicked(move |_| { let _ = host::command(&executable).spawn(); });
         expander.add_suffix(&launch);
 
         expander.add_row(&detail_row("Archive SHA-256", &installed.sha256));
 
         let folder = action_button("folder-open-symbolic", "Open Folder", "Show the installed files in your file manager.");
         let directory = installed.directory.clone();
-        folder.connect_clicked(move |_| { let _ = Command::new("xdg-open").arg(&directory).spawn(); });
+        folder.connect_clicked(move |_| { let _ = host::command("xdg-open").arg(&directory).spawn(); });
         let remove = action_button("user-trash-symbolic", "Uninstall", "Remove this application and its launcher. This cannot be undone.");
         remove.add_css_class("destructive-action");
         let handle = app.clone();
@@ -948,7 +948,7 @@ fn record_row(app: &Rc<App>, record: &InstalledRecord, updates_only: bool, busy:
     }
     let launch = row_button("media-playback-start-symbolic", "Start this application now.");
     let desktop_file = record.desktop_file_path.clone();
-    launch.connect_clicked(move |_| { let _ = Command::new("xdg-open").arg(&desktop_file).spawn(); });
+    launch.connect_clicked(move |_| { let _ = host::command("xdg-open").arg(&desktop_file).spawn(); });
     expander.add_suffix(&launch);
 
     expander.add_row(&detail_row("Installed version", record.version.as_deref().unwrap_or("Unknown version")));
@@ -958,7 +958,7 @@ fn record_row(app: &Rc<App>, record: &InstalledRecord, updates_only: bool, busy:
 
     let folder = action_button("folder-open-symbolic", "Open Folder", "Show the installed files in your file manager.");
     let install_path = record.install_path.clone();
-    folder.connect_clicked(move |_| { let _ = Command::new("xdg-open").arg(&install_path).spawn(); });
+    folder.connect_clicked(move |_| { let _ = host::command("xdg-open").arg(&install_path).spawn(); });
 
     let check = action_button("view-refresh-symbolic", "Check for Updates", "Look for a newer version using this application's configured source. TarDrop only checks when you press this.");
     check.set_sensitive(update_idle);

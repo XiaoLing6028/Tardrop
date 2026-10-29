@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>TarDrop</title>
+  <!-- An open box with a drop of tar falling into it. The box is drawn back to front so its front
+       faces and flaps cover the lower half of the drop, which reads as the drop going inside. -->
+  <path d="M16 56 64 40 112 56 64 72Z" fill="#63452c"/>
+  <path d="M64 12C55 26 46 39 46 52a18 18 0 0 0 36 0C82 39 73 26 64 12Z" fill="#3d3846"/>
+  <path d="M57 38c-3 5-5 10-5 14 0 3 1 5 3 7" fill="none" stroke="#ffffff" stroke-opacity=".45" stroke-width="4" stroke-linecap="round"/>
+  <path d="M16 56 64 72v46L16 102Z" fill="#b5835a"/>
+  <path d="M112 56 64 72v46l48-16Z" fill="#986a44"/>
+  <path d="M16 56 64 72 52 86 4 70Z" fill="#cdab8f"/>
+  <path d="M112 56 64 72 76 86 124 70Z" fill="#deb991"/>
+  <path d="M64 72v46" stroke="#63452c" stroke-opacity=".35" stroke-width="2"/>
+</svg>
